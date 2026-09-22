@@ -1,0 +1,9 @@
+fastapi>=0.109.0
+uvicorn>=0.27.0
+httpx>=0.26.0
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+python-dotenv>=1.0.0
+cos-python-sdk-v5>=1.9.44
+Pillow>=10.0.0
+python-multipart>=0.0.9

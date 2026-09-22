@@ -1,0 +1,13 @@
+services:
+  hunyuan-api:
+    build: .
+    container_name: tencent-hunyuan-to-api
+    restart: unless-stopped
+    ports:
+      - "7860:7860"
+    volumes:
+      - ./configs:/app/configs
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1

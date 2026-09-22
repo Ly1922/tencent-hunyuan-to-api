@@ -1,0 +1,20 @@
+[
+  {
+    "name": "主账号",
+    "cookie": "hunyuan_user=...; hunyuan_token=...; hunyuan_source=web;",
+    "chat_id": "dap8gfk2c3m4o8kl0ld0",
+    "enabled": true
+  },
+  {
+    "name": "副账号1",
+    "cookie": "hunyuan_user=...; hunyuan_token=...; hunyuan_source=web;",
+    "chat_id": "dap8xxxxxxxxxxxxxxx",
+    "enabled": true
+  },
+  {
+    "name": "副账号2",
+    "cookie": "hunyuan_user=...; hunyuan_token=...; hunyuan_source=web;",
+    "chat_id": "dap8yyyyyyyyyyyyyyy",
+    "enabled": true
+  }
+]

@@ -1,0 +1,23 @@
+# 敏感凭据与账号配置（严禁提交）
+.env
+configs/accounts.json
+
+# Python 缓存与构建文件
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+
+# 日志与打包
+*.log
+*.tar.gz
+*.zip
+
+# 编辑器配置
+.vscode/
+.idea/
+.DS_Store
