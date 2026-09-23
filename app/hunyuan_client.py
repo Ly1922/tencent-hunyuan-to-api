@@ -223,8 +223,13 @@ class HunyuanAccount:
                             body = await response.aread()
                             raise RuntimeError(f"HTTP {response.status_code}: {body.decode('utf-8', errors='ignore')}")
 
+                        current_sse_event = None
                         async for line in response.aiter_lines():
                             if not line:
+                                continue
+                            
+                            if line.startswith("event:"):
+                                current_sse_event = line[len("event:"):].strip()
                                 continue
                             
                             prefix = ""
@@ -240,6 +245,16 @@ class HunyuanAccount:
 
                             if content_str == "[DONE]":
                                 break
+
+                            # 处理显式 error 事件 (例如 event: error \n data: 您今日已达体验限额)
+                            if current_sse_event == "error":
+                                err_msg = content_str
+                                try:
+                                    err_json = json.loads(content_str)
+                                    err_msg = err_json.get("errorMsg") or err_json.get("message") or err_json.get("msg") or content_str
+                                except Exception:
+                                    pass
+                                raise RuntimeError(f"腾讯服务提示: {err_msg}")
 
                             try:
                                 event = json.loads(content_str)
@@ -262,14 +277,16 @@ class HunyuanAccount:
 
                                 elif event_type == "text":
                                     msg = event.get("msg", "")
-                                    if "错误" in msg or "稍后重试" in msg:
+                                    if "错误" in msg or "稍后重试" in msg or "限额" in msg:
                                         raise RuntimeError(f"腾讯服务提示: {msg}")
 
                                 elif event_type == "error":
-                                    err_msg = event.get("errorMsg") or event.get("message") or "未知错误"
+                                    err_msg = event.get("errorMsg") or event.get("message") or event.get("msg") or "未知错误"
                                     raise RuntimeError(f"腾讯模型返回错误: {err_msg}")
 
                             except json.JSONDecodeError:
+                                if "限额" in content_str or "错误" in content_str or "失败" in content_str:
+                                    raise RuntimeError(f"腾讯服务提示: {content_str}")
                                 continue
 
                 if not image_info or not (image_info.get("imageUrlHigh") or image_info.get("imageUrlLow")):
