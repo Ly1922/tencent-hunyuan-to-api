@@ -1,7 +1,7 @@
 import time
 import uuid
 from typing import List, Optional, Union, Dict, Any
-from fastapi import APIRouter, HTTPException, Header, Depends, UploadFile, File, Form
+from fastapi import APIRouter, HTTPException, Header, Depends, UploadFile, File, Form, Request
 from pydantic import BaseModel, Field
 from app.config import settings
 from app.hunyuan_client import hunyuan_pool
@@ -102,25 +102,40 @@ async def generate_images(req: ImageGenerateRequest):
 
 @router.post("/v1/images/edits", response_model=ImageGenerateResponse, dependencies=[Depends(verify_api_key)])
 async def edit_images(
+    request: Request,
     prompt: str = Form(..., description="编辑/参考生图提示词"),
     image: Optional[List[UploadFile]] = File(None, description="参考底图文件（支持单张或多张上传）"),
+    image_bracket: Optional[List[UploadFile]] = File(None, alias="image[]", description="兼容多图格式 image[]（如无限画布）"),
     images: Optional[List[UploadFile]] = File(None, description="多张参考底图文件列表"),
+    images_bracket: Optional[List[UploadFile]] = File(None, alias="images[]", description="兼容多图格式 images[]"),
     model: Optional[str] = Form(settings.DEFAULT_MODEL),
     size: Optional[str] = Form("1024x1024"),
     response_format: Optional[str] = Form("url")
 ):
     """
-    OpenAI 官方标准图生图端点 (Image Edits)，已支持多张参考图同时上传
-    通过表单直接上传单张或多张图片文件与提示词，自动上传至腾讯云并执行多图参考生图
+    OpenAI 官方标准图生图端点 (Image Edits)，完美兼容多图上传
+    - 单图模式：字段名 image
+    - 无限画布 (Infinite Canvas) 多图模式：字段名 image[]
+    - 其他多图客户端：字段名 images 或 images[]
     """
     upload_files: List[UploadFile] = []
-    if image:
-        upload_files.extend(image)
-    if images:
-        upload_files.extend(images)
+    for flist in [image, image_bracket, images, images_bracket]:
+        if flist:
+            for f in flist:
+                if f and f not in upload_files:
+                    upload_files.append(f)
+
+    # 从原生 request.form() 兜底提取任何其它命名的文件
+    try:
+        form_data = await request.form()
+        for key, val in form_data.multi_items():
+            if isinstance(val, UploadFile) and val not in upload_files:
+                upload_files.append(val)
+    except Exception:
+        pass
 
     if not upload_files:
-        raise HTTPException(status_code=400, detail="请至少上传一张参考底图 (image 或 images)")
+        raise HTTPException(status_code=400, detail="请至少上传一张参考底图 (image, image[] 或 images)")
 
     image_bytes_list = []
     for f in upload_files:
@@ -141,8 +156,8 @@ async def edit_images(
         )
         
         item = ImageItem(
-            url=res.get("url") if response_format != "b64_json" else None,
-            b64_json=res.get("b64_json") if response_format == "b64_json" else None,
+            url=res.get("url"),
+            b64_json=res.get("b64_json"),
             revised_prompt=prompt
         )
         
