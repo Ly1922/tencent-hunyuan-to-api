@@ -22,6 +22,10 @@ class HunyuanAccount:
         self.success_count = 0
         self.failed_count = 0
 
+    def _get_client(self, timeout: float = 30.0, follow_redirects: bool = False) -> httpx.AsyncClient:
+        proxy = settings.PROXY.strip() if settings.PROXY and settings.PROXY.strip() else None
+        return httpx.AsyncClient(proxy=proxy, timeout=timeout, follow_redirects=follow_redirects)
+
     def _get_base_url(self) -> str:
         return f"https://api.hunyuan.tencent.com/api/new-portal/chat/{self.chat_id}"
 
@@ -78,7 +82,7 @@ class HunyuanAccount:
         headers["Content-Type"] = "application/json"
         payload = {"fileName": filename, "resourceType": "IMAGE"}
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with self._get_client(timeout=30.0) as client:
             r = await client.post(gen_url, headers=headers, json=payload)
             if r.status_code != 200:
                 raise RuntimeError(f"获取图片上传凭据失败 HTTP {r.status_code}: {r.text}")
@@ -95,14 +99,24 @@ class HunyuanAccount:
             raise RuntimeError("腾讯云未返回有效的存储桶信息")
 
         # 3. 使用 COS SDK 上传图片数据
-        cos_cfg = CosConfig(Region=region, SecretId=secret_id, SecretKey=secret_key, Token=token, Scheme="https")
+        cos_kwargs = {
+            "Region": region,
+            "SecretId": secret_id,
+            "SecretKey": secret_key,
+            "Token": token,
+            "Scheme": "https"
+        }
+        if settings.PROXY and settings.PROXY.strip():
+            proxy_url = settings.PROXY.strip()
+            cos_kwargs["Proxies"] = {"http": proxy_url, "https": proxy_url}
+        cos_cfg = CosConfig(**cos_kwargs)
         cos_client = CosS3Client(cos_cfg)
         cos_client.put_object(Bucket=bucket, Body=image_bytes, Key=key, EnableMD5=False)
 
         # 4. 获取腾讯服务认证的 realUrl 直链
         real_url = None
         if resource_url:
-            async with httpx.AsyncClient(follow_redirects=False, timeout=30.0) as client:
+            async with self._get_client(follow_redirects=False, timeout=30.0) as client:
                 dl_resp = await client.get(resource_url, headers=self._get_headers())
                 real_url = dl_resp.headers.get("Location") or dl_resp.headers.get("location")
                 if not real_url and dl_resp.status_code == 200:
@@ -173,7 +187,7 @@ class HunyuanAccount:
                                 img_bytes = base64.b64decode(base64_data)
                             elif single_input.startswith("http://") or single_input.startswith("https://"):
                                 # 网络图片链接：自动下载后上传到腾讯云
-                                async with httpx.AsyncClient(timeout=30.0) as dl_client:
+                                async with self._get_client(timeout=30.0) as dl_client:
                                     img_resp = await dl_client.get(single_input)
                                     if img_resp.status_code == 200:
                                         img_bytes = img_resp.content
@@ -227,7 +241,7 @@ class HunyuanAccount:
             raw_data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
             try:
-                async with httpx.AsyncClient(timeout=settings.REQUEST_TIMEOUT) as client:
+                async with self._get_client(timeout=settings.REQUEST_TIMEOUT) as client:
                     async with client.stream("POST", url, headers=headers, content=raw_data) as response:
                         if response.status_code != 200:
                             body = await response.aread()
@@ -319,7 +333,7 @@ class HunyuanAccount:
                 }
 
                 if response_format == "b64_json":
-                    async with httpx.AsyncClient(timeout=30.0) as client:
+                    async with self._get_client(timeout=30.0) as client:
                         img_resp = await client.get(img_url)
                         if img_resp.status_code == 200:
                             b64_str = base64.b64encode(img_resp.content).decode("utf-8")
@@ -356,6 +370,10 @@ class HunyuanAccountPool:
             )
         self.accounts = new_accounts
         print(f"[AccountPool] 成功加载 {len(self.accounts)} 个账号")
+        if settings.PROXY and settings.PROXY.strip():
+            print(f"[AccountPool] 启用出站代理: {settings.PROXY.strip()}")
+        else:
+            print("[AccountPool] 未配置出站代理 (网络直连)")
 
     async def get_account(self) -> HunyuanAccount:
         if not self.accounts:

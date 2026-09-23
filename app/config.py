@@ -20,6 +20,9 @@ class Settings(BaseSettings):
     # 生图超时时间（秒）
     REQUEST_TIMEOUT: float = 120.0
     
+    # 代理配置（如 http://100.101.236.124:8080 或 socks5://...，留空直连）
+    PROXY: Optional[str] = None
+
     # 默认模型名称
     DEFAULT_MODEL: str = "HY-Image-3.5-Preview-4090-Tob-v1.1"
 
