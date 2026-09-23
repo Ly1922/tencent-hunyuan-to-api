@@ -132,7 +132,7 @@ class HunyuanAccount:
         model: Optional[str] = None,
         quality: str = "hd",
         response_format: str = "url",
-        image_input: Optional[Union[str, bytes]] = None
+        image_input: Optional[Union[str, bytes, List[Union[str, bytes]]]] = None
     ) -> Dict[str, Any]:
         target_model = model or settings.DEFAULT_MODEL
         if target_model.lower() in ["hy-image-3.5", "hunyuan-image-3.5", "hunyuan-3.5"]:
@@ -148,40 +148,50 @@ class HunyuanAccount:
             self.is_busy = True
             multimedia = []
 
-            # 如果提供了底图输入（图生图），自动将其上传到腾讯云
+            # 如果提供了底图输入（图生图/参考图），自动将其上传到腾讯云
             if image_input:
-                try:
-                    img_bytes = None
-                    filename = "reference.png"
+                if isinstance(image_input, (str, bytes)):
+                    input_list = [image_input]
+                elif isinstance(image_input, list):
+                    input_list = image_input
+                else:
+                    input_list = []
 
-                    if isinstance(image_input, bytes):
-                        img_bytes = image_input
-                    elif isinstance(image_input, str):
-                        # 处理 Base64 格式
-                        if image_input.startswith("data:") or ";base64," in image_input:
-                            base64_data = image_input.split(";base64,")[-1]
-                            img_bytes = base64.b64decode(base64_data)
-                        elif image_input.startswith("http://") or image_input.startswith("https://"):
-                            # 网络图片链接：自动下载后上传到腾讯云
-                            async with httpx.AsyncClient(timeout=30.0) as dl_client:
-                                img_resp = await dl_client.get(image_input)
-                                if img_resp.status_code == 200:
-                                    img_bytes = img_resp.content
-                                else:
-                                    raise RuntimeError(f"下载参考图片失败 HTTP {img_resp.status_code}")
-                        else:
-                            # 纯 Base64 字符串
-                            try:
-                                img_bytes = base64.b64decode(image_input)
-                            except Exception:
-                                pass
+                for idx, single_input in enumerate(input_list):
+                    if not single_input:
+                        continue
+                    try:
+                        img_bytes = None
+                        filename = f"reference_{idx + 1}.png"
 
-                    if img_bytes:
-                        media_item = await self.upload_image(img_bytes, filename=filename)
-                        multimedia.append(media_item)
-                except Exception as upload_err:
-                    print(f"[{self.name}] 图生图参考图片上传失败: {upload_err}")
-                    raise upload_err
+                        if isinstance(single_input, bytes):
+                            img_bytes = single_input
+                        elif isinstance(single_input, str):
+                            # 处理 Base64 格式
+                            if single_input.startswith("data:") or ";base64," in single_input:
+                                base64_data = single_input.split(";base64,")[-1]
+                                img_bytes = base64.b64decode(base64_data)
+                            elif single_input.startswith("http://") or single_input.startswith("https://"):
+                                # 网络图片链接：自动下载后上传到腾讯云
+                                async with httpx.AsyncClient(timeout=30.0) as dl_client:
+                                    img_resp = await dl_client.get(single_input)
+                                    if img_resp.status_code == 200:
+                                        img_bytes = img_resp.content
+                                    else:
+                                        raise RuntimeError(f"下载参考图片[{idx + 1}]失败 HTTP {img_resp.status_code}")
+                            else:
+                                # 纯 Base64 字符串
+                                try:
+                                    img_bytes = base64.b64decode(single_input)
+                                except Exception:
+                                    pass
+
+                        if img_bytes:
+                            media_item = await self.upload_image(img_bytes, filename=filename)
+                            multimedia.append(media_item)
+                    except Exception as upload_err:
+                        print(f"[{self.name}] 图生图参考图片[{idx + 1}]上传失败: {upload_err}")
+                        raise upload_err
 
             payload = {
                 "model": "gpt_175B_0404",
@@ -369,7 +379,7 @@ class HunyuanAccountPool:
         model: Optional[str] = None,
         quality: str = "hd",
         response_format: str = "url",
-        image_input: Optional[Union[str, bytes]] = None
+        image_input: Optional[Union[str, bytes, List[Union[str, bytes]]]] = None
     ) -> Dict[str, Any]:
         """
         调度账号进行生图（支持文生图与图生图），支持多账号故障转移

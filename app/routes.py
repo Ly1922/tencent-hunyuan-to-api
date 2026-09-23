@@ -35,7 +35,8 @@ class ImageGenerateRequest(BaseModel):
     size: Optional[str] = Field("1024x1024", description="图片分辨率或比例 (如 1024x1024, 16:9, 9:16, 4:3, 3:4)")
     quality: Optional[str] = Field("hd", description="清晰度模式: hd (满血2K原画) 或 standard (压缩预览)")
     response_format: Optional[str] = Field("url", description="返回格式: url 或 b64_json")
-    image: Optional[str] = Field(None, description="图生图参考图片（支持网络图片URL或Base64数据）")
+    image: Optional[Union[str, List[str]]] = Field(None, description="图生图参考图片（支持网络图片URL或Base64，可传单张或多张列表）")
+    images: Optional[List[str]] = Field(None, description="多张参考图片列表（支持网络图片URL或Base64数据）")
     user: Optional[str] = None
 
 class ImageItem(BaseModel):
@@ -62,10 +63,20 @@ class ChatCompletionRequest(BaseModel):
 @router.post("/v1/images/generations", response_model=ImageGenerateResponse, dependencies=[Depends(verify_api_key)])
 async def generate_images(req: ImageGenerateRequest):
     """
-    OpenAI 兼容生图端点（同时支持文生图和图生图）
+    OpenAI 兼容生图端点（同时支持文生图、单图生图、多图融合生图）
     - 纯文本生图：只传 prompt
-    - 图生图：在 image 字段中传入图片 URL 或 Base64 编码
+    - 单图/多图参考生图：在 image 字段传入单张 URL/Base64，或列表格式；也可在 images 字段传入列表
     """
+    # 汇总多张参考底图
+    all_images = []
+    if req.image:
+        if isinstance(req.image, list):
+            all_images.extend(req.image)
+        elif isinstance(req.image, str):
+            all_images.append(req.image)
+    if req.images:
+        all_images.extend(req.images)
+
     try:
         res = await hunyuan_pool.generate_image(
             prompt=req.prompt,
@@ -73,7 +84,7 @@ async def generate_images(req: ImageGenerateRequest):
             model=req.model,
             quality=req.quality or "hd",
             response_format=req.response_format or "url",
-            image_input=req.image
+            image_input=all_images if all_images else None
         )
         
         item = ImageItem(
@@ -92,23 +103,41 @@ async def generate_images(req: ImageGenerateRequest):
 @router.post("/v1/images/edits", response_model=ImageGenerateResponse, dependencies=[Depends(verify_api_key)])
 async def edit_images(
     prompt: str = Form(..., description="编辑/参考生图提示词"),
-    image: UploadFile = File(..., description="上传的参考底图"),
+    image: Optional[List[UploadFile]] = File(None, description="参考底图文件（支持单张或多张上传）"),
+    images: Optional[List[UploadFile]] = File(None, description="多张参考底图文件列表"),
     model: Optional[str] = Form(settings.DEFAULT_MODEL),
     size: Optional[str] = Form("1024x1024"),
     response_format: Optional[str] = Form("url")
 ):
     """
-    OpenAI 官方标准图生图端点 (Image Edits)
-    通过表单直接上传图片文件与提示词，自动上传至腾讯云并执行图生图
+    OpenAI 官方标准图生图端点 (Image Edits)，已支持多张参考图同时上传
+    通过表单直接上传单张或多张图片文件与提示词，自动上传至腾讯云并执行多图参考生图
     """
+    upload_files: List[UploadFile] = []
+    if image:
+        upload_files.extend(image)
+    if images:
+        upload_files.extend(images)
+
+    if not upload_files:
+        raise HTTPException(status_code=400, detail="请至少上传一张参考底图 (image 或 images)")
+
+    image_bytes_list = []
+    for f in upload_files:
+        content = await f.read()
+        if content:
+            image_bytes_list.append(content)
+
+    if not image_bytes_list:
+        raise HTTPException(status_code=400, detail="上传的参考图片内容为空")
+
     try:
-        image_bytes = await image.read()
         res = await hunyuan_pool.generate_image(
             prompt=prompt,
             size=size,
             model=model,
             response_format=response_format or "url",
-            image_input=image_bytes
+            image_input=image_bytes_list
         )
         
         item = ImageItem(
@@ -128,10 +157,10 @@ async def edit_images(
 async def chat_completions(req: ChatCompletionRequest):
     """
     OpenAI 兼容 Chat Completions 端点
-    支持多模态对话生图（纯文本对话生图、拖拽图片进对话框图生图）
+    支持多模态对话生图（纯文本生图、拖拽单张或多张图片进对话框图生图）
     """
     user_prompt = ""
-    image_ref = None
+    image_refs = []
 
     for msg in reversed(req.messages):
         if msg.role == "user":
@@ -144,9 +173,11 @@ async def chat_completions(req: ChatCompletionRequest):
                     elif part.get("type") == "image_url":
                         img_info = part.get("image_url", {})
                         if isinstance(img_info, dict):
-                            image_ref = img_info.get("url")
+                            u = img_info.get("url")
+                            if u:
+                                image_refs.append(u)
                         elif isinstance(img_info, str):
-                            image_ref = img_info
+                            image_refs.append(img_info)
             break
             
     if not user_prompt.strip():
@@ -156,12 +187,12 @@ async def chat_completions(req: ChatCompletionRequest):
         res = await hunyuan_pool.generate_image(
             prompt=user_prompt,
             model=req.model,
-            image_input=image_ref
+            image_input=image_refs if image_refs else None
         )
         img_url = res["url"]
         account_used = res.get("account", "default")
         
-        type_str = "图生图" if image_ref else "文生图"
+        type_str = f"多图参考生图({len(image_refs)}张底图)" if len(image_refs) > 1 else ("图生图" if image_refs else "文生图")
         markdown_reply = f"已为你完成{type_str}（由 {account_used} 处理）：\n\n![{user_prompt}]({img_url})\n\n[点击查看高清原图]({img_url})"
         
         return {

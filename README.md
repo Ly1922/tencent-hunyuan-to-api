@@ -9,9 +9,9 @@
 ## ✨ 特性
 
 - 👥 **多账号并发调度池**：支持通过 `configs/accounts.json` 挂载多个腾讯账号，空闲账号优先调度，实现真正的多任务并行生图！
-- 🎨 **文生图与图生图双支持**：不仅支持纯文本描述生图，还支持上传参考底图进行风格迁移、垫图修改与图生图创作！
-- 🖼️ **标准 OpenAI Images API 兼容**：支持 `POST /v1/images/generations` 与 `POST /v1/images/edits`，可无缝接入 OneAPI、NewAPI、ComfyUI、Dify 等。
-- 💬 **标准 OpenAI Chat API 兼容**：支持 `POST /v1/chat/completions`（支持在 NextChat、LobeChat、Cherry Studio 中发送文字或拖拽图片直出图）。
+- 🎨 **文生图与多图参考生图**：不仅支持纯文本生图，还支持上传单张或多张参考底图（多图融合/垫图修改/风格迁移，支持多图同时输入）！
+- 🖼️ **标准 OpenAI Images API 兼容**：支持 `POST /v1/images/generations` 与 `POST /v1/images/edits`（支持多图上传），可无缝接入 OneAPI、NewAPI、ComfyUI、Dify 等。
+- 💬 **标准 OpenAI Chat API 兼容**：支持 `POST /v1/chat/completions`（支持在 NextChat、LobeChat、Cherry Studio 中发送文字或拖拽多张图片直出图）。
 - ⚡ **超轻量与高性能**：脱离 Playwright/Puppeteer/Firefox 依赖，纯异步 SSE 流式长连接，开销极小。
 - 📐 **多比例支持**：支持 `1:1`、`16:9`、`9:16`、`3:4`、`4:3` 以及标准像素分辨率自动映射。
 - 📦 **双格式输出**：支持直接返回腾讯云 COS 高清直链（`url`），或自动拉取转码为 Base64（`b64_json`）。
@@ -97,6 +97,7 @@
 
 ### 1. OpenAI Images 风格调用 (`/v1/images/generations`)
 
+#### (1) 纯文本生图
 ```bash
 curl -X POST "http://localhost:7860/v1/images/generations" \
   -H "Content-Type: application/json" \
@@ -109,21 +110,34 @@ curl -X POST "http://localhost:7860/v1/images/generations" \
   }'
 ```
 
-**响应示例**：
-```json
-{
-  "created": 1790087774,
-  "data": [
-    {
-      "url": "https://hy-model-ap-prod-1258344703.cos.ap-guangzhou.myqcloud.com/...",
-      "revised_prompt": "赛博朋克风格的未来城市，霓虹灯光，雨夜街道，电影级光影"
-    }
-  ]
-}
+#### (2) 多参考图生图（支持多张 URL 或 Base64）
+```bash
+curl -X POST "http://localhost:7860/v1/images/generations" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer sk-your-key" \
+  -d '{
+    "prompt": "结合图一的构图与图二的色彩风格，生成一幅未来梦幻城堡",
+    "images": [
+      "https://example.com/reference1.png",
+      "https://example.com/reference2.png"
+    ],
+    "size": "16:9"
+  }'
 ```
 
-### 2. OpenAI Chat 风格调用 (`/v1/chat/completions`)
+### 2. OpenAI Edits 风格多图上传 (`/v1/images/edits`)
+支持直接上传本地多张图片文件：
+```bash
+curl -X POST "http://localhost:7860/v1/images/edits" \
+  -H "Authorization: Bearer sk-your-key" \
+  -F "prompt=将两张图的人物合成在同一张日落海滩背景中" \
+  -F "image=@photo1.jpg" \
+  -F "image=@photo2.jpg" \
+  -F "size=16:9"
+```
 
+### 3. OpenAI Chat 风格多图对话 (`/v1/chat/completions`)
+支持多模态格式发送文字并附带多张图片直出生图：
 ```bash
 curl -X POST "http://localhost:7860/v1/chat/completions" \
   -H "Content-Type: application/json" \
@@ -131,7 +145,14 @@ curl -X POST "http://localhost:7860/v1/chat/completions" \
   -d '{
     "model": "HY-Image-3.5-Preview-4090-Tob-v1.1",
     "messages": [
-      {"role": "user", "content": "画一只戴墨镜的酷酷猫咪"}
+      {
+        "role": "user",
+        "content": [
+          {"type": "text", "text": "参考这两张图的风格，画一只酷酷的赛博猫咪"},
+          {"type": "image_url", "image_url": {"url": "https://example.com/cat.png"}},
+          {"type": "image_url", "image_url": {"url": "https://example.com/cyberpunk.png"}}
+        ]
+      }
     ]
   }'
 ```
