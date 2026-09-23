@@ -135,7 +135,7 @@ class HunyuanAccount:
         image_input: Optional[Union[str, bytes, List[Union[str, bytes]]]] = None
     ) -> Dict[str, Any]:
         target_model = model or settings.DEFAULT_MODEL
-        if target_model.lower() in ["hy-image-3.5", "hunyuan-image-3.5", "hunyuan-3.5"]:
+        if target_model.lower() in ["hy-image-3.5", "hunyuan-image-3.5", "hunyuan-3.5", "dall-e-3", "dalle3", "dall-e"]:
             target_model = settings.DEFAULT_MODEL
 
         # 尺寸比例处理
