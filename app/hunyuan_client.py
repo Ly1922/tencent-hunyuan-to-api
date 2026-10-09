@@ -3,6 +3,11 @@ import base64
 import io
 import json
 import logging
+import hashlib
+import time
+from collections import OrderedDict
+from contextlib import asynccontextmanager
+from urllib.parse import parse_qs, urlsplit
 from typing import Dict, Any, Optional, List, Union
 import httpx
 from PIL import Image
@@ -10,6 +15,10 @@ from qcloud_cos import CosConfig, CosS3Client
 from app.config import settings
 
 logger = logging.getLogger("tencent_hunyuan")
+
+class GeneratedImageDownloadError(RuntimeError):
+    """The image already exists; retry downloading rather than generating again."""
+
 
 class HunyuanAccount:
     """单个腾讯混元账号实例，支持文生图与图生图"""
@@ -21,10 +30,116 @@ class HunyuanAccount:
         self.is_busy = False
         self.success_count = 0
         self.failed_count = 0
+        self._clients = {}
+        self._reference_cache = OrderedDict()
+        self._reference_inflight = {}
+        self._upload_semaphore = asyncio.Semaphore(settings.UPLOAD_CONCURRENCY)
+        self.reference_upload_count = 0
+        self.reference_cache_hits = 0
 
-    def _get_client(self, timeout: float = 30.0, follow_redirects: bool = False) -> httpx.AsyncClient:
-        proxy = settings.PROXY.strip() if settings.PROXY and settings.PROXY.strip() else None
-        return httpx.AsyncClient(proxy=proxy, timeout=timeout, follow_redirects=follow_redirects)
+    @asynccontextmanager
+    async def _get_client(self, timeout: float = 30.0, follow_redirects: bool = False):
+        # Clients are account-local; credentials are always supplied per request.
+        client = self._clients.get(follow_redirects)
+        if client is None or client.is_closed:
+            proxy = settings.PROXY.strip() if settings.PROXY and settings.PROXY.strip() else None
+            client = httpx.AsyncClient(proxy=proxy, timeout=timeout,
+                follow_redirects=follow_redirects,
+                limits=httpx.Limits(max_connections=8, max_keepalive_connections=4, keepalive_expiry=30))
+            self._clients[follow_redirects] = client
+        yield client
+
+    async def aclose(self):
+        uploads = list(self._reference_inflight.values())
+        for task in uploads:
+            task.cancel()
+        if uploads:
+            await asyncio.gather(*uploads, return_exceptions=True)
+        await asyncio.gather(*(client.aclose() for client in self._clients.values()), return_exceptions=True)
+        self._clients.clear()
+        self._reference_cache.clear()
+
+    def _cache_expiry(self, url):
+        ttl = float(settings.REFERENCE_CACHE_TTL)
+        try:
+            signing = parse_qs(urlsplit(url).query).get("q-sign-time", [""])[0]
+            if signing:
+                ttl = min(ttl, float(signing.split(";")[-1]) - time.time() - 5)
+        except (ValueError, TypeError):
+            ttl = 0
+        return time.monotonic() + max(0, ttl)
+
+    async def upload_image(self, image_bytes: bytes, filename: str = "reference.png") -> Dict[str, Any]:
+        key = hashlib.sha256(image_bytes).hexdigest()
+        now = time.monotonic()
+        for expired in [k for k, value in self._reference_cache.items() if value[0] <= now]:
+            self._reference_cache.pop(expired, None)
+        cached = self._reference_cache.get(key)
+        if cached:
+            self.reference_cache_hits += 1
+            self._reference_cache.move_to_end(key)
+            return {**cached[1], "fileName": filename, "name": filename}
+        task = self._reference_inflight.get(key)
+        if task is None:
+            async def upload():
+                async with self._upload_semaphore:
+                    item = await self._upload_image_uncached(image_bytes, filename)
+                    self.reference_upload_count += 1
+                    expiry = self._cache_expiry(item["url"])
+                    if settings.REFERENCE_CACHE_MAX_ITEMS > 0 and expiry > time.monotonic():
+                        self._reference_cache[key] = (expiry, dict(item))
+                        while len(self._reference_cache) > settings.REFERENCE_CACHE_MAX_ITEMS:
+                            self._reference_cache.popitem(last=False)
+                    return item
+            task = asyncio.create_task(upload())
+            self._reference_inflight[key] = task
+            def complete(done):
+                if self._reference_inflight.get(key) is done:
+                    self._reference_inflight.pop(key, None)
+                if not done.cancelled():
+                    done.exception()
+            task.add_done_callback(complete)
+        else:
+            self.reference_cache_hits += 1
+        item = await task
+        return {**item, "fileName": filename, "name": filename}
+
+    async def _prepare_reference(self, single_input, index):
+        if not single_input:
+            return None
+        if isinstance(single_input, bytes):
+            image_bytes = single_input
+        elif isinstance(single_input, str) and single_input.startswith(("http://", "https://")):
+            async with self._get_client(follow_redirects=True) as client:
+                response = await client.get(single_input, timeout=30.0)
+                if response.status_code != 200:
+                    raise RuntimeError(f"下载参考图片[{index + 1}]失败 HTTP {response.status_code}")
+                image_bytes = response.content
+        elif isinstance(single_input, str):
+            encoded = "".join(single_input.split(";base64,")[-1].split())
+            image_bytes = base64.b64decode(encoded, validate=True)
+        else:
+            raise ValueError("参考图片应为图片数据、URL 或 Base64")
+        if not image_bytes:
+            raise ValueError("参考图片内容为空")
+        return await self.upload_image(image_bytes, f"reference_{index + 1}.png")
+
+    async def _download_generated_image(self, url):
+        failure = "网络错误"
+        for attempt in range(3):
+            try:
+                async with self._get_client(follow_redirects=True) as client:
+                    response = await client.get(url, timeout=30.0)
+                if response.status_code == 200 and response.content:
+                    return response.content
+                failure = f"HTTP {response.status_code}"
+                if response.status_code < 500 and response.status_code != 429:
+                    break
+            except httpx.HTTPError as error:
+                failure = type(error).__name__
+            if attempt < 2:
+                await asyncio.sleep(0.2 * (attempt + 1))
+        raise GeneratedImageDownloadError(f"图片已生成，但成品下载失败：{failure}")
 
     def _get_base_url(self) -> str:
         return f"https://api.hunyuan.tencent.com/api/new-portal/chat/{self.chat_id}"
@@ -64,7 +179,7 @@ class HunyuanAccount:
             return "3:4"
         return ""
 
-    async def upload_image(self, image_bytes: bytes, filename: str = "reference.png") -> Dict[str, Any]:
+    async def _upload_image_uncached(self, image_bytes: bytes, filename: str = "reference.png") -> Dict[str, Any]:
         """
         将本地图片或下载的网络图片上传到腾讯云 COS，返回 multimedia 所需结构
         """
@@ -83,7 +198,7 @@ class HunyuanAccount:
         payload = {"fileName": filename, "resourceType": "IMAGE"}
 
         async with self._get_client(timeout=30.0) as client:
-            r = await client.post(gen_url, headers=headers, json=payload)
+            r = await client.post(gen_url, headers=headers, json=payload, timeout=30.0)
             if r.status_code != 200:
                 raise RuntimeError(f"获取图片上传凭据失败 HTTP {r.status_code}: {r.text}")
             info = r.json()
@@ -109,15 +224,17 @@ class HunyuanAccount:
         if settings.PROXY and settings.PROXY.strip():
             proxy_url = settings.PROXY.strip()
             cos_kwargs["Proxies"] = {"http": proxy_url, "https": proxy_url}
-        cos_cfg = CosConfig(**cos_kwargs)
-        cos_client = CosS3Client(cos_cfg)
-        cos_client.put_object(Bucket=bucket, Body=image_bytes, Key=key, EnableMD5=False)
+        def put_object():
+            client = CosS3Client(CosConfig(**cos_kwargs))
+            client.put_object(Bucket=bucket, Body=image_bytes, Key=key, EnableMD5=False)
+            return client
+        cos_client = await asyncio.to_thread(put_object)
 
         # 4. 获取腾讯服务认证的 realUrl 直链
         real_url = None
         if resource_url:
             async with self._get_client(follow_redirects=False, timeout=30.0) as client:
-                dl_resp = await client.get(resource_url, headers=self._get_headers())
+                dl_resp = await client.get(resource_url, headers=self._get_headers(), timeout=30.0)
                 real_url = dl_resp.headers.get("Location") or dl_resp.headers.get("location")
                 if not real_url and dl_resp.status_code == 200:
                     try:
@@ -158,91 +275,65 @@ class HunyuanAccount:
         if scale and f"{scale}" not in final_prompt and "比例" not in final_prompt:
             final_prompt = f"{final_prompt}, 画面比例{scale}"
 
+        queued_at = time.perf_counter()
         async with self.lock:
             self.is_busy = True
-            multimedia = []
-
-            # 如果提供了底图输入（图生图/参考图），自动将其上传到腾讯云
-            if image_input:
-                if isinstance(image_input, (str, bytes)):
-                    input_list = [image_input]
-                elif isinstance(image_input, list):
-                    input_list = image_input
-                else:
-                    input_list = []
-
-                for idx, single_input in enumerate(input_list):
-                    if not single_input:
-                        continue
-                    try:
-                        img_bytes = None
-                        filename = f"reference_{idx + 1}.png"
-
-                        if isinstance(single_input, bytes):
-                            img_bytes = single_input
-                        elif isinstance(single_input, str):
-                            # 处理 Base64 格式
-                            if single_input.startswith("data:") or ";base64," in single_input:
-                                base64_data = single_input.split(";base64,")[-1]
-                                img_bytes = base64.b64decode(base64_data)
-                            elif single_input.startswith("http://") or single_input.startswith("https://"):
-                                # 网络图片链接：自动下载后上传到腾讯云
-                                async with self._get_client(timeout=30.0) as dl_client:
-                                    img_resp = await dl_client.get(single_input)
-                                    if img_resp.status_code == 200:
-                                        img_bytes = img_resp.content
-                                    else:
-                                        raise RuntimeError(f"下载参考图片[{idx + 1}]失败 HTTP {img_resp.status_code}")
-                            else:
-                                # 纯 Base64 字符串
-                                try:
-                                    img_bytes = base64.b64decode(single_input)
-                                except Exception:
-                                    pass
-
-                        if img_bytes:
-                            media_item = await self.upload_image(img_bytes, filename=filename)
-                            multimedia.append(media_item)
-                    except Exception as upload_err:
-                        print(f"[{self.name}] 图生图参考图片[{idx + 1}]上传失败: {upload_err}")
-                        raise upload_err
-
-            payload = {
-                "model": "gpt_175B_0404",
-                "prompt": final_prompt,
-                "plugin": "Adaptive",
-                "displayPrompt": final_prompt,
-                "displayPromptType": 1,
-                "options": {
-                    "imageIntention": {
-                        "needIntentionModel": True,
-                        "backendUpdateFlag": 2,
-                        "userIntention": {"scale": ""}
-                    }
-                },
-                "targetLang": None,
-                "targetLangLabel": None,
-                "sourceLang": None,
-                "sourceLangLabel": None,
-                "translateModelList": [],
-                "podcast": {"voices": []},
-                "displayImageIntentionLabels": [{"type": "scale", "disPlayValue": "", "startIndex": 0, "endIndex": 0}],
-                "multimedia": multimedia,
-                "agentId": "HunyuanDefault",
-                "supportHint": 1,
-                "version": "v2",
-                "chatModelId": target_model
-            }
-
-            image_info = None
-            thinking_text = []
-            url = self._get_base_url()
-            headers = self._get_headers()
-            raw_data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-
+            job_started = time.perf_counter()
+            timings = {"queue_wait": round(job_started - queued_at, 3)}
+            uploads_before, hits_before = self.reference_upload_count, self.reference_cache_hits
+            status = "cancelled"
             try:
+                multimedia = []
+
+                upload_started = time.perf_counter()
+                input_list = image_input if isinstance(image_input, list) else ([image_input] if image_input else [])
+                uploads = [asyncio.create_task(self._prepare_reference(value, index))
+                           for index, value in enumerate(input_list) if value]
+                try:
+                    multimedia = [item for item in await asyncio.gather(*uploads) if item]
+                except BaseException:
+                    for task in uploads:
+                        task.cancel()
+                    await asyncio.gather(*uploads, return_exceptions=True)
+                    raise
+                timings["reference_upload"] = round(time.perf_counter() - upload_started, 3)
+
+                payload = {
+                    "model": "gpt_175B_0404",
+                    "prompt": final_prompt,
+                    "plugin": "Adaptive",
+                    "displayPrompt": final_prompt,
+                    "displayPromptType": 1,
+                    "options": {
+                        "imageIntention": {
+                            "needIntentionModel": True,
+                            "backendUpdateFlag": 2,
+                            "userIntention": {"scale": ""}
+                        }
+                    },
+                    "targetLang": None,
+                    "targetLangLabel": None,
+                    "sourceLang": None,
+                    "sourceLangLabel": None,
+                    "translateModelList": [],
+                    "podcast": {"voices": []},
+                    "displayImageIntentionLabels": [{"type": "scale", "disPlayValue": "", "startIndex": 0, "endIndex": 0}],
+                    "multimedia": multimedia,
+                    "agentId": "HunyuanDefault",
+                    "supportHint": 1,
+                    "version": "v2",
+                    "chatModelId": target_model
+                }
+
+                image_info = None
+                thinking_text = []
+                url = self._get_base_url()
+                headers = self._get_headers()
+                raw_data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+                upstream_started = time.perf_counter()
                 async with self._get_client(timeout=settings.REQUEST_TIMEOUT) as client:
-                    async with client.stream("POST", url, headers=headers, content=raw_data) as response:
+                    async with client.stream("POST", url, headers=headers, content=raw_data, timeout=settings.REQUEST_TIMEOUT) as response:
                         if response.status_code != 200:
                             body = await response.aread()
                             raise RuntimeError(f"HTTP {response.status_code}: {body.decode('utf-8', errors='ignore')}")
@@ -313,6 +404,7 @@ class HunyuanAccount:
                                     raise RuntimeError(f"腾讯服务提示: {content_str}")
                                 continue
 
+                timings["upstream_generation"] = round(time.perf_counter() - upstream_started, 3)
                 if not image_info or not (image_info.get("imageUrlHigh") or image_info.get("imageUrlLow")):
                     raise RuntimeError("生图完成但未找到生成的图片链接")
 
@@ -332,21 +424,30 @@ class HunyuanAccount:
                     "account": self.name
                 }
 
+                download_started = time.perf_counter()
                 if response_format == "b64_json":
-                    async with self._get_client(timeout=30.0) as client:
-                        img_resp = await client.get(img_url)
-                        if img_resp.status_code == 200:
-                            b64_str = base64.b64encode(img_resp.content).decode("utf-8")
-                            result["b64_json"] = b64_str
-
+                    data = await self._download_generated_image(img_url)
+                    result["b64_json"] = base64.b64encode(data).decode("utf-8")
+                timings["image_download"] = round(time.perf_counter() - download_started, 3)
+                result["diagnostics"] = {"timings_seconds": timings,
+                    "reference_uploads": self.reference_upload_count - uploads_before,
+                    "reference_cache_hits": self.reference_cache_hits - hits_before}
+                status = "succeeded"
                 self.success_count += 1
                 return result
 
-            except Exception as e:
+            except Exception:
+                status = "failed"
                 self.failed_count += 1
-                raise e
+                self._reference_cache.clear()
+                raise
             finally:
                 self.is_busy = False
+                timings["total"] = round(time.perf_counter() - queued_at, 3)
+                print("[HunyuanTiming] " + json.dumps({"status": status,
+                    "timings_seconds": timings,
+                    "reference_uploads": self.reference_upload_count - uploads_before,
+                    "reference_cache_hits": self.reference_cache_hits - hits_before}), flush=True)
 
 
 class HunyuanAccountPool:
@@ -355,25 +456,43 @@ class HunyuanAccountPool:
         self.accounts: List[HunyuanAccount] = []
         self._round_robin_idx = 0
         self._pool_lock = asyncio.Lock()
+        self._retired_accounts = []
+        self._cleanup_tasks = set()
         self.reload_accounts()
 
     def reload_accounts(self):
         account_configs = settings.load_accounts()
+        old = {(account.name, account.cookie, account.chat_id): account for account in self.accounts}
         new_accounts = []
         for conf in account_configs:
-            new_accounts.append(
-                HunyuanAccount(
-                    name=conf["name"],
-                    cookie=conf["cookie"],
-                    chat_id=conf["chat_id"]
-                )
-            )
+            key = (conf["name"], conf["cookie"], conf["chat_id"])
+            account = old.pop(key, None)
+            new_accounts.append(account or HunyuanAccount(*key))
+        for retired in old.values():
+            self._retired_accounts.append(retired)
+            try:
+                task = asyncio.get_running_loop().create_task(self._close_retired(retired))
+                self._cleanup_tasks.add(task)
+                task.add_done_callback(self._cleanup_tasks.discard)
+            except RuntimeError:
+                pass
         self.accounts = new_accounts
         print(f"[AccountPool] 成功加载 {len(self.accounts)} 个账号")
         if settings.PROXY and settings.PROXY.strip():
             print(f"[AccountPool] 启用出站代理: {settings.PROXY.strip()}")
         else:
             print("[AccountPool] 未配置出站代理 (网络直连)")
+
+    async def _close_retired(self, account):
+        async with account.lock:
+            await account.aclose()
+        if account in self._retired_accounts:
+            self._retired_accounts.remove(account)
+
+    async def aclose(self):
+        if self._cleanup_tasks:
+            await asyncio.gather(*list(self._cleanup_tasks), return_exceptions=True)
+        await asyncio.gather(*(account.aclose() for account in self.accounts + self._retired_accounts))
 
     async def get_account(self) -> HunyuanAccount:
         if not self.accounts:
@@ -423,6 +542,8 @@ class HunyuanAccountPool:
                     response_format=response_format,
                     image_input=image_input
                 )
+            except GeneratedImageDownloadError:
+                raise  # A generation already succeeded; do not generate it again on another account.
             except Exception as e:
                 last_error = e
                 print(f"[AccountPool] 账号 {acc.name} 执行失败: {e}，正在尝试其它账号...")

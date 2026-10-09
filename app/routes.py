@@ -47,6 +47,7 @@ class ImageItem(BaseModel):
 class ImageGenerateResponse(BaseModel):
     created: int
     data: List[ImageItem]
+    diagnostics: Optional[Dict[str, Any]] = None
 
 # --- OpenAI Chat API 兼容模型定义 ---
 class ChatMessage(BaseModel):
@@ -95,7 +96,8 @@ async def generate_images(req: ImageGenerateRequest):
         
         return ImageGenerateResponse(
             created=int(time.time()),
-            data=[item]
+            data=[item],
+            diagnostics=res.get("diagnostics")
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"生成失败: {str(e)}")
@@ -163,7 +165,8 @@ async def edit_images(
         
         return ImageGenerateResponse(
             created=int(time.time()),
-            data=[item]
+            data=[item],
+            diagnostics=res.get("diagnostics")
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"图生图失败: {str(e)}")

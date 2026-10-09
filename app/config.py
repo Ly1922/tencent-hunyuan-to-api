@@ -2,6 +2,7 @@ import os
 import json
 from typing import List, Dict, Any, Optional
 from pydantic_settings import BaseSettings
+from pydantic import Field
 
 class Settings(BaseSettings):
     HOST: str = "0.0.0.0"
@@ -19,6 +20,9 @@ class Settings(BaseSettings):
     
     # 生图超时时间（秒）
     REQUEST_TIMEOUT: float = 120.0
+    REFERENCE_CACHE_TTL: float = Field(120.0, ge=0, le=3600)
+    REFERENCE_CACHE_MAX_ITEMS: int = Field(64, ge=0, le=512)
+    UPLOAD_CONCURRENCY: int = Field(2, ge=1, le=4)
     
     # 代理配置（如 http://100.101.236.124:8080 或 socks5://...，留空直连）
     PROXY: Optional[str] = None

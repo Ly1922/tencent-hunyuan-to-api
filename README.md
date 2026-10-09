@@ -176,3 +176,17 @@ curl -X POST "http://localhost:7860/v1/chat/completions" \
 
 ## 📄 开源许可
 MIT License.
+
+## 本地性能优化
+
+参考图上传按账号和图片内容缓存，默认有效期 120 秒、每账号最多 64 项；缓存仅驻留内存，重启后清空，并提前避开签名 URL 的过期时间。相同图片重复生成时复用上传结果，主图和参考图仍按原始顺序发送。更换图片内容或账号会重新上传。
+
+可通过环境变量设置 `REFERENCE_CACHE_TTL`（0–3600 秒，0 关闭缓存）、`REFERENCE_CACHE_MAX_ITEMS`（0–512，0 关闭缓存）、`UPLOAD_CONCURRENCY`（1–4，默认 2）。COS 上传放入工作线程，避免阻塞其他请求；HTTP 连接按账号复用，服务退出时关闭。上传失败、任务取消后释放账号状态，成品下载最多重试三次，下载失败不会重新消耗一次生图任务。
+
+图像接口返回额外的 `diagnostics` 字段，包含排队、参考图上传、腾讯生成、成品下载和总耗时（秒），以及本次实际上传数与缓存命中数。日志中以 `[HunyuanTiming]` 输出同样的耗时摘要。腾讯生成阶段仍取决于上游服务速度。
+
+离线回归测试（模拟网络，不调用生图）：
+
+```powershell
+python -m unittest discover -s tests -p test_optimizations.py -v
+```

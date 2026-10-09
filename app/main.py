@@ -1,11 +1,21 @@
 import uvicorn
+from contextlib import asynccontextmanager
+from app.hunyuan_client import hunyuan_pool
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from app.config import settings
 from app.routes import router
 
+@asynccontextmanager
+async def lifespan(app):
+    try:
+        yield
+    finally:
+        await hunyuan_pool.aclose()
+
 app = FastAPI(
+    lifespan=lifespan,
     title="Tencent Hunyuan 3.5 To API",
     description="A lightweight OpenAI-compatible API gateway for Tencent Hy AI Studio (Hunyuan Image 3.5).",
     version="1.0.0"
